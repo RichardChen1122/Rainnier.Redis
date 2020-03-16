@@ -698,3 +698,149 @@
   - 足够的内存，不要100%内存部满
 
 # Redis开发运维常见问题
+## fork 操作
+- 同步操作
+  - 大部分情况下速度快，但是有时也会有问题
+  - 与内存量息息相关：内存越大，耗时越长
+  - info：latest_fork_usec  上次fork 执行的微秒数
+
+- 优先使用物理机或者高效支持fork 操作的虚拟化技术
+- 控制Redis 实例最大可用内存：maxmemory
+- 合理配置Linux 内存分配策略vm.overcommit_memory=1 (默认为0)
+- 降低fork频率：例如放宽AOF重写自动触发时机，不必要的全量复制
+## 子进程开销和优化
+- CPU开销 
+  - 开销：RDB和AOF 文件生成，属于CPU密集
+  - 优化：不要做CPU绑定，不和CPU密集型应用一起部署
+- 内存
+  - 开销：fork 内存开销，copy-on-write(linux写时复制机制)，父子进程共享相同物理内存页，但父进程有写请求会创建一个副本，如果父进程有大量写入，子进程开销就很大
+  - 优化： echo never > /sys/kernel/mm/transparent_hugpage/enabled
+- 硬盘的消耗
+  - 开销：AOF和RDB文件写入，可以结合iostat, iotop 分析
+  - 不要和高硬盘负载服务部署在一起
+  - no-appendfsync-on-rewrite=yes
+  - 根据写入量决定磁盘类型，如ssd
+  - 单机多实例持久化文件目录可以考虑分盘
+
+## AOF追加阻塞
+- 通常是每秒刷磁盘策略
+- 主线程会监测对比上次fsync 的时间，如果大于2s就阻塞，小于2s就通过
+- 主线程不能阻塞
+- AOF阻塞定位
+  - Redis 日志
+  - redis命令 info persistence
+
+# Redis复制原理和优化
+## 什么是主从复制
+- 单机有什么问题
+  - 机器发生故障
+  - 容量瓶颈，16G内存， redis 用了12G， 如果要64G内存怎么办？
+  - QPS瓶颈，几百万QPS怎么办
+- 主从复制的作用
+  - master-slave
+    - slave 复制master
+  - 一主多从
+    - 数据可以有多个副本，更加高可用
+    - 扩展读性能,读写分离，master 有很多读写，把读的流量分流，负载均衡
+ - 简单总结
+   - 一个master可以有多个slave
+   - 一个slave只有有一个master
+   - 每个slave 也可以有slave
+   - 数据流向时单向的，master 到slave
+
+## 复制的配置
+- 两种方式
+  - slaveof命令
+    - 6380作为6379 的从节点：
+      redis-6380> slaveof 127.0.0.1 6379
+      #这个命令时异步的，会直接返回，但实际需要时间
+      redis-6380> slaveof no one  #取消复制
+  - 配置
+    - slaveof ip port
+    - slave-read-only yes
+  - 比较
+    - 命令无需重启，但不便于管理
+    - 配置可以同一配置，但需要重启redis
+- 主从复制配置操作
+  - info replication -> role:master
+## 全量复制和部分复制
+- RunId 和偏移量
+  - RunId时redis的唯一标识，重启会变，salve感受到master变了他会做全量复制
+  - 偏移量，一致的时候，主从同步。
+    - info replication -> master_repl_offset
+- 全量复制过程
+  - slave给master 发 psync(runId, offet) -> 初始psync(？, -1)
+  - master FULLRESYNC 告诉slave runId 和我的偏移量
+  - slave保存master基本信息，master 会去执行bgsave 保存RDB快照
+  - 在bgsave 期间新的写入会进入repl_back_buffer这个缓冲区
+  - master send RDB to slave
+  - master send buffer to slave
+  - slave flush old data
+  - load new RDB and buffer
+- 全量复制开销(很大)
+  - bgsave 时间
+  - RDB文件网络传输时间
+  - 从节点清空数据时间
+  - 从节点加载RDB时间
+  - 可能的AOF重写
+- 部分复制的过程
+  - 假如slave 与master 断开连接
+  - 断开期间新的写入会进入repl_back_buffer这个缓冲区
+  - 网络恢复后重连，slave 发送psync {runID} {offset}
+  - 如果offset在buffer区间内，master 会响应continue，并把这部分数据发给slave
+## 故障处理
+- 故障不可避免，不要害怕故障
+  - 无自动故障转移，就很崩溃
+  - 自动故障转移，保证服务整体的可用性
+- 主从结构的故障
+  - slave宕机
+    - 使用这个slave客户端转到使用其他slave
+  - master宕机
+    - 只读客户端正常
+    - 客户端去找一个master->其他slave 转移到这个master
+  - sentinel可以主从复制故障转移
+## 开发运维的常见问题
+- 读写分离
+  - 读流量分摊到从节点
+  - 可能遇到的问题
+    - 复制数据延迟
+    - 读到过期的数据，slave 节点不能删除数据，salve 可能会读到脏数据
+    - 从节点故障，怎么做客户端分离
+
+- 主从复制不一致
+  - 例如maxmemory不一致：丢失数据
+  - 数据结构优化参数(hash-max-ziplist-entries)：内存不一致
+
+- 规避全量复制
+  - 第一次全量复制 
+    - 第一次不可避免
+    - 小主节点，低峰， maxmemory 不要设置太大，晚上负载低的时候做这个事
+  - 节点运行ID不匹配
+    - 主节点重启(运行ID变化)
+    - 故障转移，例如哨兵或集群
+  - 复制积压缓冲区不足
+    - 是个队列，大小为1M就只能buffer 1M
+    - 网络中断，部分复制无法满足
+    - 增大复制缓冲区配置 rel_backlog_size，网络"增强"
+
+- 规避复制风暴
+  - 单节点复制风暴
+    - 问题：主节点，多从节点复制
+    - 解决：更换复制拓扑，但这种也会有问题
+  - 单机器复制风暴
+    - 机器宕机后，大量全复制
+    - 解决：主节点分散多机器
+    - master挂了Slave 晋升成master
+
+# sentinel
+## 主从复制高可用？
+
+## 架构说明
+
+## 安装配置
+
+## 客户端连接
+
+## 实现原理
+
+## 常见开发运维问题
