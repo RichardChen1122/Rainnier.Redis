@@ -1,4 +1,4 @@
-# Redis初识
+# Redis初识111111
 ## Redis 特性
 - 速度快  
     - 10W OPS  
